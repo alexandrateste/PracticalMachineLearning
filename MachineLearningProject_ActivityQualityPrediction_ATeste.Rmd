@@ -1,0 +1,362 @@
+---
+title: "Prediction of Activity Quality"
+author: "Alexandra Teste"
+date: "September 19, 2015"
+output: html_document
+---
+
+In this project, we studied the data collected by [Velloso et al.](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) from accelerometers on the belt, forearm, arm, and dumbell of 6 participants, who performed one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+Two separate files were provided: one with the training set, and one with the test set. The goal was to determine to which class each of the 20 events of the test set belonged. To do so, we used the training dataset and built a classification model that we subsequently applied to the elements of the test set.
+
+We first pre-processed the training set by removing unneeded variables and transforming categorical variables into dummy ones. We then built and compared 3 models: support vector machine, adaboost and random forest. The latter performed the best, with an out-of-sample error estimate of 0.4%. We used it to predict the class of the 20 events present in the test set.
+
+## Data Exploration
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(caret)
+library(knitr)
+library(ggplot2)
+library(GGally)
+library(grid)
+library(gridExtra)
+library(dplyr)
+library(RANN)
+library(randomForest)
+library(rpart)
+library(RGtk2)
+library(e1071)
+library(mlbench)
+library(lattice)
+library(reshape2)
+library(plyr)
+library(cluster)
+library(foreach)
+library(adabag)
+trainingset <- read.csv(file="pml-training.csv", header=TRUE, sep=",")
+testingset <- read.csv(file="pml-testing.csv", header=TRUE, sep=",")
+```
+
+To allow for the proper determination of an out-of-sample accuracy at the end of this project, we will conduct data exploration and model building on the training set only.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+str(trainingset[,1:10])
+```
+
+*Table 1: Training dataset dimensions and first 10 variables*
+
+The training dataset is composed of 19622 observations and 160 variables, as shown on Table 1. The first 7 variables respectively describe the observation number, the participant's name, 3 sorts of timestamps and 2 window indicators. The last variable corresponds to the quality class of each activity. The rest of the variables are actual accelerometer, gyroscope and magnetometer measurements and their associated distribution function moments (avg, std and variance, skewness and kurtosis) as well as maximum and minimum values. Three other variables (roll, pitch and yaw) along with similar features as decribed above are contained in this dataset. The moments provided were computed from subsets of data selected with a sliding window of 0.5 to 2.5 seconds.
+
+The summary table 2 (truncated for space sake) shows a rather equal distribution of observations among the 6 participants, Adelmo having the biggest number (3892) and Pedro the smallest (2610). By examining the file, we can also see that the training set is sorted by class and grouped by participant.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+summary(trainingset[,1:10])
+```
+
+*Table 2: Descriptive statistics of the first 10 variables in the activity dataset*
+
+In addition, from the density distribution on Figure 1, each participant properly lifted the dumbell more often than in each of the 4 bad possible ways. The biggest difference was observed for Jeremy, who lifted the dumbell correctly about 38% of the time. Jeremy is also the only participant whose most common mistake is not of class B (i.e. throwing the elbows to the front). Thus, the participants variable (i.e. "user_name") should be considered as one of the possible predictors.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(trainingset, aes(x= classe, group = user_name)) + 
+   geom_bar(aes(y = ..density.., fill = factor(..x..))) + 
+   facet_grid(~user_name) + 
+   scale_fill_brewer(name = 'Classe', breaks = 1:5, 
+                     labels = levels(trainingset$classe), palette = 'Set3') +
+   labs(title = "Performance quality by participant", x="Classe", y="Density")
+```
+
+*Figure 1: Distribution of activity quality by participant*
+
+The long version of Table 2 also points to the fact that 100 variables have missing data, either under the form of an "NA" (67 of them) or of a blank value (33 of them). Each of these 100 variables actually has 19216 missing values (i.e. NA or blank). 32 of these variables also have occurrences of "#DIV/0!". As the great majority of the observations are missing, they cannot be imputed. Consequently, these 100 variables will not be considered further.
+
+## Data Pre-processing
+
+### 1. Missing data
+
+The 100 variables identified above as having a majority of NAs or blank values are those that captured the amplitude, min, max, average, standard deviation and variance, and skewness and kurtosis of the roll, pitch and yaw variables. As indicated previously, these variables are from now on removed from the training data set, and will be removed from the test set too. We are then left with 60 variables.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Removal of all columns with a majority of missing data
+training_subset<-select(trainingset, -matches("amplitude|min|max|avg|stddev|var|skewness|kurtosis"))
+summary(training_subset[,50:60])
+```
+
+*Table 3: Descriptive statistics of the exploitable subset of the training set -- Last 10 variables only*
+
+From the long version of Table 3, none of the remaining variables presents missing values.
+
+### 2. Anomalies investigation and further data cleaning
+
+To have an idea of how the remaining data are distributed, we plot some of the intuitionaly most relevant variables. For each of the 3 types of measurements ("gyros", "accel" and "magnet") and each of the 4 instrument locations (arm, forearm, belt, dumbbell), we plot the distribution of the z component. Figure 2 presents these distributions. Most of them look Gaussian-like, except gyros_foream/dumbbell_z, which are very highly skewed. Some other variables have a bi-modal or a less skewed distribution. The plots for the x and y components are similar to those shown on Figure 2.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+par(mfrow=c(3,4))
+hist(training_subset$gyros_arm_z,xlab='Gyros Arm z', main='')
+hist(training_subset$gyros_forearm_z,xlab='Gyros Forearm z', main='')
+hist(training_subset$gyros_belt_z,xlab='Gyros Belt z', main='')
+hist(training_subset$gyros_dumbbell_z,xlab='Gyros Dumbbell z', main='')
+hist(training_subset$accel_arm_z,xlab='Accel Arm z', main='')
+hist(training_subset$accel_forearm_z,xlab='Accel Forearm z', main='')
+hist(training_subset$accel_belt_z,xlab='Accel Belt z', main='')
+hist(training_subset$accel_dumbbell_z,xlab='Accel Dumbbell z', main='')
+hist(training_subset$magnet_arm_z,xlab='Magnet Arm z', main='')
+hist(training_subset$magnet_forearm_z,xlab='Magnet Forearm z', main='')
+hist(training_subset$magnet_belt_z,xlab='Magnet Belt z', main='')
+hist(training_subset$magnet_dumbbell_z,xlab='Magnet Dumbbell z', main='')
+```
+
+*Figure 2: Distribution of the z-component of some of the remaining variables*
+
+Looking more precisely at the summary of these 2 variables (cf. Table 3 for "forearm"), the maximum value is a lot bigger than the 3rd quartile, which indicates the presence of at least one outlier for each of these variables. A plot (not shown here) of the same variables without the extreme values shows more Gaussian distributions.
+
+As the goal of this project is to classify the data into 5 categories (classes A through E), it is not necessary to proceed to the removal of outliers, to a standardization of the data, nor to the calculation of principal components. The only additional pre-processing needed here consists in:
+
+- discarding the first variable "X", as it corresponds to the observation number
+- discarding the "cvtd_timestamp" variable because it the "mm/dd/yyyy HH:MM" representation of the epoch time that is available in the variable "raw_timestamp_part_1", i.e. "cvtd_timestamp" contains only redundant information
+- discarding all other time and window variables. Indeed, scatter plots (not shown) with the timestamps and window variables do not show any relationship to the class, which indicates that the good and bad versions of the exercise were not performed in any particular temporal order (i.e. no improvement over the course of time).
+- replacing "user_name" by 6 dummy variables
+- randomizing the dataset, as all data are currently sorted by classe and by participant.
+
+Table 4 shows the 10 first columns of the resulting training dataframe.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Removal of the observation number, time and window variables
+col_drop <- c("X", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+train_subset_simple <- training_subset[,!(names(training_subset) %in% col_drop)]
+dummies<-dummyVars(classe~user_name,data=train_subset_simple)
+dummies_df <- predict(dummies,newdata=train_subset_simple)
+train_subset_simple2 <- cbind(dummies_df,train_subset_simple[,2:54]) #Replacement of participants names by dummy variables
+summary(train_subset_simple2[,1:10])
+
+set.seed(100) # Setting the seed for reproducibility
+indd<-sample(nrow(train_subset_simple2))
+randomized_simple <- train_subset_simple2[indd,]
+```
+
+*Table 4: Descriptive statistics of the final version of the training set -- First 10 variables only*
+
+Now that our dataset is ready, we can start building our classification model. To do so, we consider several methods: support vector machine, adaboost and random forest. In each case, we run a 10-fold cross-validation, which allows us to get an estimate of the out-of-sample error.
+
+## Model building
+
+### 1. Support vector machine
+
+With this method, we choose a Gaussian radial basis function kernel (i.e. each observation is represented by a Gaussian). This requires us to find the best value for 2 parameters: gamma and C, where gamma is the equivalent of the inverse of the coefficient in the exponential of the Gaussian, and C is the parameter of the cost function (more details are available [here](https://www.quora.com/What-are-C-and-gamma-with-regards-to-a-support-vector-machine)). To do so, we do a [grid search](http://www.jstatsoft.org/article/view/v015i09) for each of these parameters, respectively between 0.0001 and 0.1, and between 10 and 1000. We only consider here a subset of the training set (~10%).
+
+Table 5 shows that for our dataset, the best value is 0.01 for gamma and 100 for C.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Tuning of the SVM model: Grid search for gamma and C
+tobj <- tune.svm(classe ~ ., data = randomized_simple[1:2000, ], gamma = 10^(-4:-1), cost = 10^(1:3))
+summary(tobj)
+```
+
+*Table 5: Results of the grid search for the 2 parameters of the SVM model*
+
+Using these best values, we build the support vector machine model for the entire training dataset. Note that the "svm" function in R allows for the argument "cross", which signifies the number of k-fold cross-validations to conduct. Here, we choose cross=10. The presence of this argument explains why we consider the entire dataset here, and not 10 different 90% subsets of it. Table 6 presents the accuracy obtained for each of the 10 cross-validations, along with their average, which corresponds to our estimate of the out-of-sample accuracy. With SVM, this accuracy is of ~99.3%, i.e. the corresponding error is 0.7%. Table 7 shows the actual classification results.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+bestGamma<-tobj$best.parameters[[1]]
+bestC<-tobj$best.parameters[[2]]
+model <- svm(classe ~ ., data = randomized_simple, cost = bestC, gamma = bestGamma, cross = 10)
+summary(model)
+```
+
+*Table 6: Results of the SVM model, and individual and average of the 10 cross-validations accuracies*
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+predict_train <- predict(model, randomized_simple)
+table(randomized_simple$classe,predict_train)
+```
+
+*Table 7: Confusion matrix on the training set*
+
+Building the model on 90% of the dataset, and testing it with the remaining 10% allows to confirm that this accuracy is correct. Training on the first 19000 elements of our randomized set, and testing on the remianing 622 gives an accuracy of 99.7%.
+
+### 2. Adaboost: Adaptive Boosting
+
+With this method, we build weak preditors (i.e. simple trees), which outputs are combined into a weighted sum representing the final output of the boosted classifier. The adaptive part of Adaboost comes from the fact that subsequent trees "focus" more on points that were misclassified by previous trees (as explained on the [Wikipedia page](https://en.wikipedia.org/wiki/AdaBoost)).
+
+Here, we use the "[boosting.cv](http://artax.karlin.mff.cuni.cz/r-help/library/adabag/html/boosting.cv.html)" function, which allows us to pass several arguments: "v" the number of cross-validations, "boos" to indicate the boosted aspect of the algorithm, "mfinal" the number of trees, and "maxdepth" (through rpart.control) the number of nodes (tree root excluded). We choose v=10, boos=TRUE, mfinal=100 and maxdepth=5 (and the default coeflearn="Breiman").
+
+Table 8 presents the times of completion of each cross-validation, the confusion matrix and the error obtained with the Adaboost method. With an estimated error of 44.1%, it is not a good classifier.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+modboost<-boosting.cv(classe ~., data=randomized_simple, v = 10, boos = TRUE, mfinal = 100, coeflearn = "Breiman", control=rpart.control(maxdepth=5))
+modboost[c("confusion","error")]
+```
+
+*Table 8: Time of completion of each cross-validation, confusion matrix, and overall error for the Adaboost model*
+
+### 3. Random Forest
+
+With this method, we create a [random forest](http://www.inside-r.org/packages/cran/randomForest/docs/rfcv) of 100 trees with a 10-fold cross-validation, using the function rfcv. At each new iteration, we impose the number of remaining variables to be [50%](https://www.kaggle.com/c/forest-cover-type-prediction/forums/t/10532/r-randomforest-rfcv-function-explanation-in-laymans-terms) that of the previous one. Table 9 shows the number of variables used and the corresponding average error obtained. The estimated out-of-sample error is ~0.4%, i.e. slightly better than with the SVM model.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+trainx <- randomized_simple[,1:58]
+trainy <- randomized_simple[,59]
+randomfor <- rfcv(trainx, trainy, cv.fold=10, scale="log", step=0.5, ntree=100)
+randomfor$error.cv
+```
+
+*Table 9: Number of variables considered and corresponding errors obtained with the Random Forest model*
+
+## Test set classification
+
+From Table 10, it is clear that the SVM and Random Forest models work a lot better than the Adaboost. This may suggest that some of the parameters used for the latter are not adapted to the present problem. As the other 2 models work extremely well, we do not conduct further tuning of the Adaboost model. To predict the class of the test data, we use our best model: Random Forest.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+Method <- c("SVM","Adaboost","RandomForest")
+Time <- c("10min","64min","15min")
+Error <- c("0.7%","44.2%","0.4%")
+results <- data.frame(Method, Time, Error)
+kable(results, row.names = NA)
+```
+
+*Table 10: Performance comparison between the 3 methods*
+
+As for the training set, we remove all columns with a majority of missing data points, all columns related to time, the observation number column, and replace the participants names by dummy variables (cf. summary of first 10 columns in Table 11).
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+testing_subset<-select(testingset, -matches("amplitude|min|max|avg|stddev|var|skewness|kurtosis"))
+col_drop <- c("X", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+test_subset_simple <- testing_subset[,!(names(testing_subset) %in% col_drop)]
+dummies<-dummyVars(problem_id~user_name,data=test_subset_simple)
+dummies_df <- predict(dummies,newdata=test_subset_simple)
+test_subset_simple2 <- cbind(dummies_df,test_subset_simple[,2:54]) #Replacement of participants names by dummy variables
+summary(test_subset_simple2[,1:10])
+```
+
+*Table 11: Transformed test data - Summary of the first 10 columns only*
+
+We then build the Random Forest model again (but using randomForest and no longer rfcv) with the whole training dataset, and apply it to these transformed testing data. The results obtained are shown in Table 12.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+randomf<-randomForest(classe~.,data=randomized_simple,ntree=100)
+predict_test <- predict(randomf, newdata=test_subset_simple2)
+predict_test
+```
+
+*Table 12: Results obtained for the test set*
+
+
+From there, we create the individual files to be submitted on the Coursera page.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# pml_write_files = function(x){
+#   n = length(x)
+#   for(i in 1:n){
+#     filename = paste0("problem_id_",i,".txt")
+#     write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+#   }
+# }
+# pml_write_files(predict_test)
+```
+
+## Conclusion
+
+By studying the activity dataset, we identified the presence of variables with a majority of missing data or without correlation with the outcome class. After removing them from the training dataset, and replacing the participants names by dummy variables, we built 3 classification models. With an estimated error of 0.4%, the random forest proved to be the best. This is the one we applied to the test set that we had transformed in the same way as the training set.
+As we write this conclusion after submitting the 20 individual result files, we can indicate that all submissions were correct, which is consistent with an extremely small error rate.
+
+## Appendix
+This section contains all codes used to generate the graphs, tables and calculations shown above.
+```{r, echo=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+# Loading of libraries
+library(caret); library(knitr); library(ggplot2); library(GGally); library(grid)
+library(gridExtra); library(dplyr); library(RANN); library(randomForest); library(rpart)
+library(RGtk2); library(e1071)
+trainingset <- read.csv(file="pml-training.csv", header=TRUE, sep=",")
+testingset <- read.csv(file="pml-testing.csv", header=TRUE, sep=",")
+
+# Initial Training dataset exploration
+str(trainingset[,1:10])
+summary(trainingset[,1:10])
+ggplot(trainingset, aes(x= classe, group = user_name)) + 
+   geom_bar(aes(y = ..density.., fill = factor(..x..))) + 
+   facet_grid(~user_name) + 
+   scale_fill_brewer(name = 'Classe', breaks = 1:5, 
+                     labels = levels(trainingset$classe), palette = 'Set3') +
+   labs(title = "Performance quality by participant", x="Classe", y="Density")
+
+# Removal of all columns with a majority of missing data
+training_subset<-select(trainingset, -matches("amplitude|min|max|avg|stddev|var|skewness|kurtosis"))
+summary(training_subset[,50:60])
+
+# Distribution of a few variables
+par(mfrow=c(3,4))
+hist(training_subset$gyros_arm_z,xlab='Gyros Arm z', main='')
+hist(training_subset$gyros_forearm_z,xlab='Gyros Forearm z', main='')
+hist(training_subset$gyros_belt_z,xlab='Gyros Belt z', main='')
+hist(training_subset$gyros_dumbbell_z,xlab='Gyros Dumbbell z', main='')
+hist(training_subset$accel_arm_z,xlab='Accel Arm z', main='')
+hist(training_subset$accel_forearm_z,xlab='Accel Forearm z', main='')
+hist(training_subset$accel_belt_z,xlab='Accel Belt z', main='')
+hist(training_subset$accel_dumbbell_z,xlab='Accel Dumbbell z', main='')
+hist(training_subset$magnet_arm_z,xlab='Magnet Arm z', main='')
+hist(training_subset$magnet_forearm_z,xlab='Magnet Forearm z', main='')
+hist(training_subset$magnet_belt_z,xlab='Magnet Belt z', main='')
+hist(training_subset$magnet_dumbbell_z,xlab='Magnet Dumbbell z', main='')
+
+# Removal of the observation number, time and window variables
+col_drop <- c("X", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+train_subset_simple <- training_subset[,!(names(training_subset) %in% col_drop)]
+dummies<-dummyVars(classe~user_name,data=train_subset_simple)
+dummies_df <- predict(dummies,newdata=train_subset_simple)
+train_subset_simple2 <- cbind(dummies_df,train_subset_simple[,2:54]) #Replacement of participants names by dummy variables
+summary(train_subset_simple2[,1:10])
+
+set.seed(100) # Setting the seed for reproducibility
+indd<-sample(nrow(train_subset_simple2))
+randomized_simple <- train_subset_simple2[indd,]
+
+# Models building
+# Tuning of the SVM model: Grid search for gamma and C
+tobj <- tune.svm(classe ~ ., data = randomized_simple[1:2000, ], gamma = 10^(-4:-1), cost = 10^(1:3))
+summary(tobj)
+bestGamma<-tobj$best.parameters[[1]]
+bestC<-tobj$best.parameters[[2]]
+model <- svm(classe ~ ., data = randomized_simple, cost = bestC, gamma = bestGamma, cross = 10)
+summary(model)
+predict_train <- predict(model, randomized_simple)
+table(randomized_simple$classe,predict_train)
+
+# Adaboost
+modboost<-boosting.cv(classe ~., data=randomized_simple, v = 10, boos = TRUE, mfinal = 100, coeflearn = "Breiman", control=rpart.control(maxdepth=5))
+modboost[c("confusion","error")]
+
+# Random Forest
+trainx <- randomized_simple[,1:58]
+trainy <- randomized_simple[,59]
+randomfor <- rfcv(trainx, trainy, cv.fold=10, scale="log", step=0.5, ntree=100)
+randomfor$error.cv
+
+# Comparison table
+Method <- c("SVM","Adaboost","RandomForest")
+Time <- c("10min","64min","15min")
+Error <- c("0.7%","44.2%","0.4%")
+results <- data.frame(Method, Time, Error)
+kable(results, row.names = NA)
+
+# Transformation of the test set and application of the SVM model
+testing_subset<-select(testingset, -matches("amplitude|min|max|avg|stddev|var|skewness|kurtosis"))
+col_drop <- c("X", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+test_subset_simple <- testing_subset[,!(names(testing_subset) %in% col_drop)]
+dummies<-dummyVars(classe~user_name,data=test_subset_simple)
+dummies_df <- predict(dummies,newdata=test_subset_simple)
+test_subset_simple2 <- cbind(dummies_df,test_subset_simple[,2:54]) #Replacement of participants names by dummy variables
+summary(test_subset_simple2[,1:10])
+
+# Random Forest model building for the whole training set and application to the test set
+randomf<-randomForest(classe~.,data=randomized_simple,ntree=100)
+predict_test <- predict(randomf, newdata=test_subset_simple2)
+predict_test
+
+# Creation of the files to submit
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(predict_test)
